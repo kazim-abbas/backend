@@ -180,14 +180,21 @@ async function verifySignupOtp({ email, code }) {
 
   let user;
   try {
-    user = await User.create({
+    // Create user first without password_hash
+    user = new User({
       email: normalizedEmail,
       name: pending.name,
       role: pending.role,
       agency_id: finalAgencyId,
-      password_hash: pending.password_hash, // already bcrypted
       email_verified: true, // the whole point — verification happened via OTP
     });
+    
+    // Set password directly from the hash stored in PendingSignup
+    // Bypass setPassword() since we already have a valid bcrypt hash
+    user.password_hash = pending.password_hash;
+    
+    // Save the user with the pre-hashed password
+    await user.save();
   } catch (err) {
     // Uniqueness race: another verify request won, or the user created
     // an account by other means between request-otp and verify-otp. Roll
