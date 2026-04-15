@@ -2,6 +2,8 @@ const env = require('../config/env');
 const logger = require('../utils/logger');
 
 let resendClient = null;
+let startupChecked = false;
+
 function getClient() {
   if (!env.resend.apiKey) return null;
   if (!resendClient) {
@@ -12,21 +14,65 @@ function getClient() {
 }
 
 /**
+ * Run once, the first time anyone tries to send. Surface misconfiguration
+ * early and loudly in logs rather than silently swallowing every send.
+ *
+ * Resend rejects any `from` address on a domain you haven't verified in
+ * the Resend dashboard — so the default placeholder
+ * `notifications@example.com` will ALWAYS fail delivery in prod. Warn
+ * aggressively so operators notice before users complain.
+ */
+function checkConfigOnce() {
+  if (startupChecked) return;
+  startupChecked = true;
+
+  if (!env.resend.apiKey) {
+    logger.warn('email_misconfigured', {
+      issue: 'RESEND_API_KEY not set — all emails will be skipped',
+    });
+    return;
+  }
+  if (!env.resend.fromEmail || env.resend.fromEmail === 'notifications@example.com') {
+    logger.warn('email_misconfigured', {
+      issue:
+        'RESEND_FROM_EMAIL is empty or the placeholder default — Resend will reject sends. Set it to an address on a verified Resend domain.',
+      current: env.resend.fromEmail,
+    });
+  }
+}
+
+/**
  * Best-effort send. Never throws — email failure should not break the
- * request path. All sends are logged.
+ * request path. Every send is logged, including skip/failure reasons, so
+ * that prod issues are diagnosable from logs alone.
+ *
+ * Returns one of:
+ *   { sent: true,  id }             on success
+ *   { sent: false, error }          on failure (API rejection or thrown error)
+ *   { skipped: true, reason }       when config/input prevented the send
  */
 async function send({ to, subject, html, text }) {
-  const client = getClient();
-  if (!client) {
-    logger.warn('email_send_skipped_no_api_key', { to, subject });
-    return { skipped: true };
+  checkConfigOnce();
+
+  if (!env.resend.apiKey) {
+    logger.warn('email_send_skipped', { to, subject, reason: 'no_api_key' });
+    return { skipped: true, reason: 'no_api_key' };
   }
   if (!to) {
-    logger.warn('email_send_skipped_no_recipient', { subject });
-    return { skipped: true };
+    logger.warn('email_send_skipped', { subject, reason: 'no_recipient' });
+    return { skipped: true, reason: 'no_recipient' };
+  }
+  if (!env.resend.fromEmail) {
+    logger.error('email_send_skipped', { to, subject, reason: 'no_from_email' });
+    return { skipped: true, reason: 'no_from_email' };
   }
 
+  const client = getClient();
+
   try {
+    // Resend SDK returns { data, error }: it does NOT throw on API errors,
+    // so we must check `error` explicitly. Only unexpected exceptions
+    // (network, SDK bug) reach the catch block.
     const result = await client.emails.send({
       from: env.resend.fromEmail,
       to,
@@ -34,16 +80,37 @@ async function send({ to, subject, html, text }) {
       html,
       text,
     });
+
+    if (result?.error) {
+      // Common failure shape: { statusCode, message, name }
+      const errMsg = result.error.message || result.error.name || 'unknown resend error';
+      logger.error('email_send_failed', {
+        to,
+        subject,
+        from: env.resend.fromEmail,
+        statusCode: result.error.statusCode,
+        name: result.error.name,
+        error: errMsg,
+      });
+      return { sent: false, error: errMsg };
+    }
+
     logger.info('email_sent', { to, subject, id: result?.data?.id });
     return { sent: true, id: result?.data?.id };
   } catch (err) {
-    logger.error('email_send_failed', { to, subject, error: err.message });
+    logger.error('email_send_failed', {
+      to,
+      subject,
+      from: env.resend.fromEmail,
+      error: err.message,
+      stack: err.stack,
+    });
     return { sent: false, error: err.message };
   }
 }
 
 async function sendNewTicketAlert({ agency, ticket, recipientEmail }) {
-  if (!recipientEmail && !agency?.contact_email) return { skipped: true };
+  if (!recipientEmail && !agency?.contact_email) return { skipped: true, reason: 'no_recipient' };
   return send({
     to: recipientEmail || agency.contact_email,
     subject: `[${agency.name}] New support ticket`,
@@ -58,7 +125,7 @@ async function sendNewTicketAlert({ agency, ticket, recipientEmail }) {
 }
 
 async function sendReplyNotification({ agency, ticket, recipientEmail, replyText }) {
-  if (!recipientEmail) return { skipped: true };
+  if (!recipientEmail) return { skipped: true, reason: 'no_recipient' };
   return send({
     to: recipientEmail,
     subject: `[${agency.name}] New reply on your ticket`,
@@ -68,7 +135,7 @@ async function sendReplyNotification({ agency, ticket, recipientEmail, replyText
 }
 
 async function sendPasswordResetEmail({ email, name, resetUrl }) {
-  if (!email) return { skipped: true };
+  if (!email) return { skipped: true, reason: 'no_recipient' };
   return send({
     to: email,
     subject: 'Reset your password',
@@ -99,7 +166,7 @@ This link expires in 1 hour.`,
 }
 
 async function sendEmailVerification({ email, name, verifyUrl }) {
-  if (!email) return { skipped: true };
+  if (!email) return { skipped: true, reason: 'no_recipient' };
   return send({
     to: email,
     subject: 'Verify your email',
@@ -128,7 +195,7 @@ This link expires in 24 hours.`,
 }
 
 async function sendTokenUsageWarning({ agency, percent }) {
-  if (!agency?.contact_email) return { skipped: true };
+  if (!agency?.contact_email) return { skipped: true, reason: 'no_recipient' };
   return send({
     to: agency.contact_email,
     subject: `[${agency.name}] AI token usage at ${Math.round(percent * 100)}%`,

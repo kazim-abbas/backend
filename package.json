@@ -8,7 +8,8 @@
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
     "seed": "node src/utils/seed.js",
-    "set-admin": "node src/utils/set-admin.js"
+    "set-admin": "node src/utils/set-admin.js",
+    "test-email": "node src/utils/test-email.js"
   },
   "engines": {
     "node": ">=18.0.0"

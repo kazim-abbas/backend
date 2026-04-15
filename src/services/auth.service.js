@@ -80,18 +80,44 @@ async function register({ email, password, name, role = 'agency', agency_id = nu
 
   await user.save();
 
-  // Fire-and-forget: never let an email hiccup block signup.
+  // Fire-and-forget: never let an email hiccup block signup. We still
+  // inspect the result object because emailService.send() catches its own
+  // errors internally and returns { sent, skipped, error } — so a .catch()
+  // alone would never fire. Log the outcome so Railway logs show whether
+  // the mail was actually delivered or silently skipped.
   emailService
     .sendEmailVerification({
       email: user.email,
       name: user.name,
       verifyUrl: buildUrl('/verify-email', rawVerifyToken),
     })
+    .then((result) => logEmailOutcome('verification_email', user.email, result))
     .catch((err) =>
       logger.warn('verification_email_send_failed', { error: err.message })
     );
 
   return { user, token: signToken(user) };
+}
+
+// Uniform logging shape for every fire-and-forget transactional email.
+// Makes it trivial to grep Railway logs for `"kind":"verification_email"`
+// and see all attempts, outcomes, and failure reasons at once.
+function logEmailOutcome(kind, recipient, result) {
+  if (result?.sent) {
+    logger.info('transactional_email_sent', { kind, to: recipient, id: result.id });
+  } else if (result?.skipped) {
+    logger.warn('transactional_email_skipped', {
+      kind,
+      to: recipient,
+      reason: result.reason || 'unknown',
+    });
+  } else if (result?.sent === false) {
+    logger.error('transactional_email_failed', {
+      kind,
+      to: recipient,
+      error: result.error,
+    });
+  }
 }
 
 /**
@@ -124,6 +150,7 @@ async function forgotPassword({ email, agency_slug }) {
       name: user.name,
       resetUrl: buildUrl('/reset-password', rawToken),
     })
+    .then((result) => logEmailOutcome('password_reset_email', user.email, result))
     .catch((err) =>
       logger.warn('reset_email_send_failed', { error: err.message })
     );
@@ -207,6 +234,7 @@ async function resendVerification({ email, agency_slug }) {
       name: user.name,
       verifyUrl: buildUrl('/verify-email', rawToken),
     })
+    .then((result) => logEmailOutcome('verification_email_resend', user.email, result))
     .catch((err) =>
       logger.warn('verification_email_send_failed', { error: err.message })
     );
