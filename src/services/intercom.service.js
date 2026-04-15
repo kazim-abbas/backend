@@ -13,10 +13,10 @@ const AppError = require('../utils/AppError');
  * express.raw({ type: 'application/json' }) so `req.body` is a Buffer here.
  */
 function verifySignature(rawBody, signatureHeader) {
-  if (!env.intercom.apiKey) {
+  if (!env.intercom.clientSecret) {
     // Fail closed in production, permissive in dev so local testing works.
     if (env.isProd) return false;
-    logger.warn('intercom_api_key_missing_dev_mode_allow');
+    logger.warn('intercom_client_secret_missing_dev_mode_allow');
     return true;
   }
   if (!signatureHeader) return false;
@@ -25,7 +25,7 @@ function verifySignature(rawBody, signatureHeader) {
   if (!provided) return false;
 
   const expected = crypto
-    .createHmac('sha1', env.intercom.apiKey)
+    .createHmac('sha1', env.intercom.clientSecret)
     .update(rawBody)
     .digest('hex');
 

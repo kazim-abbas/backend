@@ -23,6 +23,7 @@ const env = {
   intercom: {
     apiKey: optional('INTERCOM_API_KEY'),
     adminId: optional('INTERCOM_ADMIN_ID'),
+    clientSecret: optional('INTERCOM_CLIENT_SECRET'),
   },
 
   openai: {
