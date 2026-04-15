@@ -165,31 +165,38 @@ This link expires in 1 hour.`,
   });
 }
 
-async function sendEmailVerification({ email, name, verifyUrl }) {
+/**
+ * Signup OTP email. The code is the whole payload — there is no link to
+ * click, which sidesteps link-prefetch attacks, deliverability quirks from
+ * security scanners that "open" URLs, and the usual broken-email-client
+ * issues. The HTML renders the 6 digits in a large monospace block for
+ * easy copy / read-aloud.
+ */
+async function sendSignupOtp({ email, name, code, ttlMinutes = 15 }) {
   if (!email) return { skipped: true, reason: 'no_recipient' };
+  if (!code) return { skipped: true, reason: 'no_code' };
   return send({
     to: email,
-    subject: 'Verify your email',
+    subject: `Your verification code: ${code}`,
     text: `Hi ${name || 'there'},
 
-Welcome! Please confirm your email address by opening the link below:
+Your verification code is:
 
-${verifyUrl}
+    ${code}
 
-This link expires in 24 hours.`,
+Enter this code on the verification page to finish creating your account.
+
+This code expires in ${ttlMinutes} minutes. If you didn't start a signup, you can safely ignore this email.`,
     html: `
       <p>Hi ${escapeHtml(name || 'there')},</p>
-      <p>Welcome! Please confirm your email address by clicking the button below:</p>
-      <p>
-        <a href="${escapeHtml(verifyUrl)}"
-           style="display:inline-block;padding:10px 16px;border-radius:6px;background:#5b8def;color:#fff;text-decoration:none;">
-          Verify email
-        </a>
+      <p>Your verification code is:</p>
+      <p style="margin:24px 0;text-align:center;">
+        <span style="display:inline-block;padding:16px 24px;font-family:'SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace;font-size:32px;letter-spacing:8px;background:#f4f6fb;border:1px solid #d9dde6;border-radius:8px;color:#1a1a1a;">
+          ${escapeHtml(String(code))}
+        </span>
       </p>
-      <p style="font-size:12px;color:#666;">Or paste this link into your browser:<br/>
-        <span style="word-break:break-all;">${escapeHtml(verifyUrl)}</span>
-      </p>
-      <p style="font-size:12px;color:#666;">This link expires in 24 hours.</p>
+      <p>Enter this code on the verification page to finish creating your account.</p>
+      <p style="font-size:12px;color:#666;">This code expires in ${ttlMinutes} minutes. If you didn't start a signup, you can safely ignore this email.</p>
     `,
   });
 }
@@ -221,5 +228,5 @@ module.exports = {
   sendReplyNotification,
   sendTokenUsageWarning,
   sendPasswordResetEmail,
-  sendEmailVerification,
+  sendSignupOtp,
 };

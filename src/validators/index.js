@@ -24,12 +24,14 @@ const auth = {
     token: z.string().min(20).max(200),
     password: z.string().min(8).max(200),
   }),
-  verifyEmail: z.object({
-    token: z.string().min(20).max(200),
-  }),
-  resendVerification: z.object({
+  // Signup OTP is a 6-digit numeric string. We accept the regex match
+  // rather than coerce to a number so leading zeros are preserved.
+  verifyOtp: z.object({
     email: z.string().email(),
-    agency_slug: z.string().optional(),
+    code: z.string().regex(/^\d{6}$/, 'Code must be 6 digits'),
+  }),
+  resendOtp: z.object({
+    email: z.string().email(),
   }),
 };
 

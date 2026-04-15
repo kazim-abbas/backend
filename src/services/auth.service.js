@@ -1,18 +1,31 @@
 const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const env = require('../config/env');
-const { User, Agency } = require('../models');
+const { User, Agency, PendingSignup } = require('../models');
 const AppError = require('../utils/AppError');
 const emailService = require('./email.service');
 const logger = require('../utils/logger');
 
-// Reset links expire after 1 hour; verification links after 24 hours.
+// --- TTLs -------------------------------------------------------------------
+// Reset links expire after 1 hour; signup OTPs after 15 min. Short OTP TTL
+// limits the brute-force window; 15 min is still long enough for a user to
+// switch to their mail client and type the code.
 const RESET_TOKEN_TTL_MS = 60 * 60 * 1000;
-const VERIFY_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
+const SIGNUP_OTP_TTL_MS = 15 * 60 * 1000;
+const SIGNUP_OTP_MAX_ATTEMPTS = 5;
 
+// --- Token / OTP helpers ----------------------------------------------------
 function generateRawToken() {
   // URL-safe, 32 bytes of entropy — plenty for short-lived bearer tokens.
   return crypto.randomBytes(32).toString('hex');
+}
+
+function generateOtp() {
+  // 6-digit numeric OTP. randomInt is cryptographically secure. Zero-padded
+  // so codes starting with 0 display correctly in the email.
+  const n = crypto.randomInt(0, 1_000_000);
+  return String(n).padStart(6, '0');
 }
 
 function hashToken(raw) {
@@ -41,85 +54,194 @@ function verifyToken(token) {
   }
 }
 
-async function register({ email, password, name, role = 'agency', agency_id = null, agencyName }) {
+// --- Signup OTP flow --------------------------------------------------------
+// The pattern deliberately avoids creating a User record until the OTP
+// verifies. This means:
+//   - A typo'd or hostile email can't create zombie accounts.
+//   - Unverified users don't sit in the Users collection forever.
+//   - Email enumeration on `/register` is harder because nothing persists
+//     on the user-facing collection until the code matches.
+
+/**
+ * Stage 1 of signup: stash the payload + OTP in PendingSignup, email the
+ * code. No User or Agency is written yet.
+ *
+ * Returns { email } opaquely; callers should not tell the client whether
+ * the email was already in use — the verify step handles that race.
+ */
+async function requestSignupOtp({ email, password, name, role = 'agency', agency_id = null, agencyName }) {
   if (!email || !password) {
     throw AppError.badRequest('email and password are required');
+  }
+  if (password.length < 8) {
+    throw AppError.badRequest('password must be at least 8 characters');
   }
 
   const normalizedEmail = email.toLowerCase().trim();
 
-  // Creating a new agency inline during signup is a common onboarding path.
-  let finalAgencyId = agency_id;
-  if (!finalAgencyId && role === 'agency' && agencyName) {
-    const agency = await Agency.create({
-      name: agencyName,
-      slug: slugify(agencyName),
-      contact_email: normalizedEmail,
-    });
-    finalAgencyId = agency._id;
-  }
-
-  const existing = await User.findOne({ email: normalizedEmail, agency_id: finalAgencyId });
+  // Fast-fail obvious conflicts. We still rely on the unique index at
+  // verify time, but catching this early gives a clearer error to honest
+  // users who simply forgot they already have an account.
+  const agencyFilter = agency_id ? { agency_id } : { agency_id: null };
+  const existing = await User.findOne({ email: normalizedEmail, ...agencyFilter });
   if (existing) {
-    throw AppError.conflict('A user with this email already exists for this agency');
+    throw AppError.conflict('An account with this email already exists. Try signing in instead.');
   }
 
-  const user = new User({
+  // Pre-hash the password now so the plaintext is never persisted — even
+  // in the pending record. bcrypt cost 12 matches User.setPassword.
+  const salt = await bcrypt.genSalt(12);
+  const password_hash = await bcrypt.hash(password, salt);
+
+  const otp = generateOtp();
+  const otp_hash = hashToken(otp);
+  const expires_at = new Date(Date.now() + SIGNUP_OTP_TTL_MS);
+
+  // Upsert: if the user hits "Register" twice with the same email (e.g.
+  // didn't get the first code), replace the pending record rather than
+  // accumulating rows. attempts resets, TTL refreshes.
+  await PendingSignup.findOneAndUpdate(
+    { email: normalizedEmail },
+    {
+      email: normalizedEmail,
+      password_hash,
+      name: name || '',
+      role,
+      agency_id: agency_id || null,
+      agency_name: agencyName || '',
+      otp_hash,
+      expires_at,
+      attempts: 0,
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  );
+
+  const result = await emailService.sendSignupOtp({
     email: normalizedEmail,
     name: name || '',
-    role,
-    agency_id: finalAgencyId,
+    code: otp,
+    ttlMinutes: Math.round(SIGNUP_OTP_TTL_MS / 60000),
   });
-  await user.setPassword(password);
+  logEmailOutcome('signup_otp', normalizedEmail, result);
 
-  // Email verification token. The raw token is emailed, only the hash is
-  // persisted, so a DB leak cannot be used to verify someone else's email.
-  const rawVerifyToken = generateRawToken();
-  user.email_verification_token_hash = hashToken(rawVerifyToken);
-  user.email_verification_expires = new Date(Date.now() + VERIFY_TOKEN_TTL_MS);
+  return { email: normalizedEmail, expires_in_seconds: Math.round(SIGNUP_OTP_TTL_MS / 1000) };
+}
 
-  await user.save();
+/**
+ * Stage 2 of signup: verify the OTP and materialize the User/Agency.
+ *
+ * Error strategy:
+ *   - Wrong code / expired code → 400. Increment `attempts`.
+ *   - attempts >= MAX → 400 "try again later", force a fresh request-otp.
+ *   - Anything goes wrong after the User.create → delete the half-written
+ *     Agency so retries aren't blocked by a stale agency row.
+ */
+async function verifySignupOtp({ email, code }) {
+  if (!email || !code) throw AppError.badRequest('email and code are required');
+  const normalizedEmail = email.toLowerCase().trim();
 
-  // Fire-and-forget: never let an email hiccup block signup. We still
-  // inspect the result object because emailService.send() catches its own
-  // errors internally and returns { sent, skipped, error } — so a .catch()
-  // alone would never fire. Log the outcome so Railway logs show whether
-  // the mail was actually delivered or silently skipped.
-  emailService
-    .sendEmailVerification({
-      email: user.email,
-      name: user.name,
-      verifyUrl: buildUrl('/verify-email', rawVerifyToken),
-    })
-    .then((result) => logEmailOutcome('verification_email', user.email, result))
-    .catch((err) =>
-      logger.warn('verification_email_send_failed', { error: err.message })
+  const pending = await PendingSignup.findOne({ email: normalizedEmail });
+  if (!pending) {
+    throw AppError.badRequest('No pending signup found — please request a new code.');
+  }
+  if (pending.expires_at <= new Date()) {
+    await PendingSignup.deleteOne({ _id: pending._id });
+    throw AppError.badRequest('Code expired — please request a new one.');
+  }
+  if (pending.attempts >= SIGNUP_OTP_MAX_ATTEMPTS) {
+    throw AppError.badRequest('Too many incorrect attempts — please request a new code.');
+  }
+
+  const submittedHash = hashToken(String(code).trim());
+  if (submittedHash !== pending.otp_hash) {
+    pending.attempts += 1;
+    await pending.save();
+    const remaining = Math.max(0, SIGNUP_OTP_MAX_ATTEMPTS - pending.attempts);
+    throw AppError.badRequest(
+      remaining > 0
+        ? `Incorrect code. ${remaining} attempt${remaining === 1 ? '' : 's'} left.`
+        : 'Too many incorrect attempts — please request a new code.'
     );
+  }
+
+  // --- Code matches — materialize account ---------------------------------
+  // Create agency inline only if one wasn't already chosen. `createdAgency`
+  // is tracked so we can clean it up if the subsequent User insert fails.
+  let finalAgencyId = pending.agency_id || null;
+  let createdAgency = null;
+  if (!finalAgencyId && pending.role === 'agency' && pending.agency_name) {
+    createdAgency = await Agency.create({
+      name: pending.agency_name,
+      slug: slugify(pending.agency_name),
+      contact_email: normalizedEmail,
+    });
+    finalAgencyId = createdAgency._id;
+  }
+
+  let user;
+  try {
+    user = await User.create({
+      email: normalizedEmail,
+      name: pending.name,
+      role: pending.role,
+      agency_id: finalAgencyId,
+      password_hash: pending.password_hash, // already bcrypted
+      email_verified: true, // the whole point — verification happened via OTP
+    });
+  } catch (err) {
+    // Uniqueness race: another verify request won, or the user created
+    // an account by other means between request-otp and verify-otp. Roll
+    // back the agency we just created so we don't orphan it.
+    if (createdAgency) {
+      await Agency.deleteOne({ _id: createdAgency._id }).catch(() => {});
+    }
+    if (err.code === 11000) {
+      await PendingSignup.deleteOne({ _id: pending._id }).catch(() => {});
+      throw AppError.conflict('An account with this email already exists.');
+    }
+    throw err;
+  }
+
+  // Single-use: always drop the pending record on success.
+  await PendingSignup.deleteOne({ _id: pending._id }).catch(() => {});
 
   return { user, token: signToken(user) };
 }
 
-// Uniform logging shape for every fire-and-forget transactional email.
-// Makes it trivial to grep Railway logs for `"kind":"verification_email"`
-// and see all attempts, outcomes, and failure reasons at once.
-function logEmailOutcome(kind, recipient, result) {
-  if (result?.sent) {
-    logger.info('transactional_email_sent', { kind, to: recipient, id: result.id });
-  } else if (result?.skipped) {
-    logger.warn('transactional_email_skipped', {
-      kind,
-      to: recipient,
-      reason: result.reason || 'unknown',
-    });
-  } else if (result?.sent === false) {
-    logger.error('transactional_email_failed', {
-      kind,
-      to: recipient,
-      error: result.error,
-    });
+/**
+ * Regenerate and re-send the OTP. Does NOT extend the original expiry
+ * window — the new `expires_at` fully replaces it, which is strictly safer
+ * than "sliding" a single long-lived code.
+ */
+async function resendSignupOtp({ email }) {
+  if (!email) throw AppError.badRequest('email is required');
+  const normalizedEmail = email.toLowerCase().trim();
+
+  const pending = await PendingSignup.findOne({ email: normalizedEmail });
+  if (!pending) {
+    // Opaque: don't confirm/deny whether a pending signup exists. Success
+    // shape matches the happy path so callers can't infer the answer.
+    return { ok: true };
   }
+
+  const otp = generateOtp();
+  pending.otp_hash = hashToken(otp);
+  pending.expires_at = new Date(Date.now() + SIGNUP_OTP_TTL_MS);
+  pending.attempts = 0;
+  await pending.save();
+
+  const result = await emailService.sendSignupOtp({
+    email: normalizedEmail,
+    name: pending.name,
+    code: otp,
+    ttlMinutes: Math.round(SIGNUP_OTP_TTL_MS / 60000),
+  });
+  logEmailOutcome('signup_otp_resend', normalizedEmail, result);
+
+  return { ok: true };
 }
 
+// --- Password reset (URL-based, unchanged) ----------------------------------
 /**
  * Kick off a password reset. Always returns a generic success response so
  * attackers cannot enumerate which emails exist in which agency.
@@ -183,65 +305,7 @@ async function resetPassword({ token, password }) {
   return { user, token: signToken(user) };
 }
 
-/**
- * Consume an email-verification token. Single-use: clears the hash after.
- */
-async function verifyEmail({ token }) {
-  if (!token) throw AppError.badRequest('token is required');
-  const tokenHash = hashToken(token);
-
-  const user = await User.findOne({
-    email_verification_token_hash: tokenHash,
-    email_verification_expires: { $gt: new Date() },
-  }).select('+email_verification_token_hash +email_verification_expires');
-
-  if (!user) throw AppError.badRequest('Verification link is invalid or expired');
-
-  user.email_verified = true;
-  user.email_verification_token_hash = '';
-  user.email_verification_expires = null;
-  await user.save();
-
-  return { user };
-}
-
-/**
- * Resend the email verification link. Mirrors forgotPassword's opaque
- * success behavior to avoid account enumeration.
- */
-async function resendVerification({ email, agency_slug }) {
-  const normalizedEmail = (email || '').toLowerCase().trim();
-  if (!normalizedEmail) throw AppError.badRequest('email is required');
-
-  let agencyFilter = { agency_id: null };
-  if (agency_slug) {
-    const agency = await Agency.findOne({ slug: agency_slug.toLowerCase() });
-    if (!agency) return { ok: true };
-    agencyFilter = { agency_id: agency._id };
-  }
-
-  const user = await User.findOne({ email: normalizedEmail, ...agencyFilter });
-  if (!user || !user.is_active || user.email_verified) return { ok: true };
-
-  const rawToken = generateRawToken();
-  user.email_verification_token_hash = hashToken(rawToken);
-  user.email_verification_expires = new Date(Date.now() + VERIFY_TOKEN_TTL_MS);
-  await user.save();
-
-  emailService
-    .sendEmailVerification({
-      email: user.email,
-      name: user.name,
-      verifyUrl: buildUrl('/verify-email', rawToken),
-    })
-    .then((result) => logEmailOutcome('verification_email_resend', user.email, result))
-    .catch((err) =>
-      logger.warn('verification_email_send_failed', { error: err.message })
-    );
-
-  return { ok: true };
-}
-
+// --- Login ------------------------------------------------------------------
 async function login({ email, password, agency_slug }) {
   if (!email || !password) {
     throw AppError.badRequest('email and password are required');
@@ -267,6 +331,7 @@ async function login({ email, password, agency_slug }) {
   return { user, token: signToken(user) };
 }
 
+// --- Helpers ----------------------------------------------------------------
 function slugify(name) {
   return name
     .toLowerCase()
@@ -276,13 +341,33 @@ function slugify(name) {
     .slice(0, 64) || `agency-${Date.now()}`;
 }
 
+// Uniform logging shape for every fire-and-forget transactional email so
+// `kind` is always greppable in Railway logs.
+function logEmailOutcome(kind, recipient, result) {
+  if (result?.sent) {
+    logger.info('transactional_email_sent', { kind, to: recipient, id: result.id });
+  } else if (result?.skipped) {
+    logger.warn('transactional_email_skipped', {
+      kind,
+      to: recipient,
+      reason: result.reason || 'unknown',
+    });
+  } else if (result?.sent === false) {
+    logger.error('transactional_email_failed', {
+      kind,
+      to: recipient,
+      error: result.error,
+    });
+  }
+}
+
 module.exports = {
   signToken,
   verifyToken,
-  register,
+  requestSignupOtp,
+  verifySignupOtp,
+  resendSignupOtp,
   login,
   forgotPassword,
   resetPassword,
-  verifyEmail,
-  resendVerification,
 };

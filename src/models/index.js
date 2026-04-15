@@ -5,4 +5,5 @@ module.exports = {
   HelpArticle: require('./HelpArticle'),
   TokenUsage: require('./TokenUsage'),
   AdminSettings: require('./AdminSettings'),
+  PendingSignup: require('./PendingSignup'),
 };
