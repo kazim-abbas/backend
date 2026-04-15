@@ -318,15 +318,31 @@ async function login({ email, password, agency_slug }) {
     throw AppError.badRequest('email and password are required');
   }
 
-  // Scope login to agency when slug is provided; otherwise match admins (agency_id=null).
-  let agencyFilter = { agency_id: null };
+  const normalizedEmail = email.toLowerCase().trim();
+
+  let user;
   if (agency_slug) {
+    // Slug-scoped portal (clients, agents). The lookup MUST stay bound to
+    // that agency so an identical email at another agency can't be matched.
     const agency = await Agency.findOne({ slug: agency_slug.toLowerCase() });
     if (!agency) throw AppError.unauthorized('Invalid credentials');
-    agencyFilter = { agency_id: agency._id };
+    user = await User.findOne({ email: normalizedEmail, agency_id: agency._id })
+      .select('+password_hash');
+  } else {
+    // No slug — dashboard login. Prefer platform admins (agency_id: null) so
+    // admin auth behaves exactly as before; otherwise fall back to agency
+    // owners / agents who authenticate on the same /login page without a
+    // slug. 'client' is excluded: clients always use the per-agency portal.
+    user = await User.findOne({ email: normalizedEmail, agency_id: null })
+      .select('+password_hash');
+    if (!user) {
+      user = await User.findOne({
+        email: normalizedEmail,
+        role: { $in: ['agency', 'agent'] },
+      }).select('+password_hash');
+    }
   }
 
-  const user = await User.findOne({ email: email.toLowerCase(), ...agencyFilter }).select('+password_hash');
   if (!user || !user.is_active) throw AppError.unauthorized('Invalid credentials');
 
   const ok = await user.verifyPassword(password);
