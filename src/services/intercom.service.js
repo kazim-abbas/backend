@@ -40,28 +40,47 @@ function verifySignature(rawBody, signatureHeader) {
 }
 
 /**
+ * Extract the primary contact from an Intercom conversation payload.
+ * Modern Intercom webhooks put the full contact (with custom_attributes)
+ * in `contacts.contacts[]`. Older payloads used `user` or `source.author`.
+ */
+function extractPrimaryContact(conversation) {
+  const fromContactsList = conversation?.contacts?.contacts?.[0];
+  return (
+    fromContactsList ||
+    conversation?.user ||
+    conversation?.source?.author ||
+    null
+  );
+}
+
+/**
  * Resolve the tenant agency for an Intercom event.
  *
  * Strategy (in priority order):
- *   1. custom_attributes.agency_id on the user or company (explicit mapping)
+ *   1. custom_attributes.agency_id on the contact or company (explicit mapping)
  *   2. company.company_id matching an Agency _id (recommended: use Agency _id as Intercom company_id)
  *   3. app_id → Agency.intercom_app_id
  */
 async function resolveAgencyFromEvent(data) {
   const conversation = data?.item || data;
-  const user = conversation?.user || conversation?.source?.author;
-  const company = user?.companies?.companies?.[0] || user?.companies?.[0];
+  const contact = extractPrimaryContact(conversation);
+  const company =
+    contact?.companies?.companies?.[0] || contact?.companies?.[0];
 
-  // 1. Explicit custom attribute
+  // 1. Explicit custom attribute (works for Leads)
   const customAgencyId =
-    user?.custom_attributes?.agency_id ||
+    contact?.custom_attributes?.agency_id ||
     company?.custom_attributes?.agency_id;
   if (customAgencyId) {
     const byCustom = await Agency.findById(customAgencyId).catch(() => null);
     if (byCustom) return byCustom;
+    logger.warn('intercom_agency_id_cda_no_match', {
+      custom_agency_id: customAgencyId,
+    });
   }
 
-  // 2. Intercom company_id === Agency _id
+  // 2. Intercom company_id === Agency _id (requires identified User, not Lead)
   if (company?.company_id) {
     const byCompany = await Agency.findById(company.company_id).catch(() => null);
     if (byCompany) return byCompany;
@@ -73,6 +92,17 @@ async function resolveAgencyFromEvent(data) {
     const byApp = await Agency.findOne({ intercom_app_id: appId });
     if (byApp) return byApp;
   }
+
+  // Nothing matched — dump enough of the payload to debug.
+  logger.warn('intercom_event_resolver_debug', {
+    has_contacts_list: Boolean(conversation?.contacts?.contacts?.length),
+    has_user: Boolean(conversation?.user),
+    has_source_author: Boolean(conversation?.source?.author),
+    contact_type: contact?.type,
+    contact_custom_attributes: contact?.custom_attributes || null,
+    company_id_on_contact: company?.company_id || null,
+    app_id: data?.app_id || null,
+  });
 
   return null;
 }
@@ -189,7 +219,7 @@ async function handleEvent(event) {
     return { status: 'ignored', reason: 'no_conversation_id' };
   }
 
-  const intercomUser = conversation.user || conversation.source?.author;
+  const intercomUser = extractPrimaryContact(conversation);
   const user = await upsertClientUser({ agency, intercomUser });
   if (!user) {
     logger.warn('intercom_event_no_user', { topic, conversation_id: intercomConversationId });
