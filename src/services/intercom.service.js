@@ -94,7 +94,7 @@ async function resolveAgencyFromEvent(data) {
   }
 
   // Nothing matched — dump enough of the payload to debug.
-  logger.warn('intercom_event_resolver_debug', {
+  const debugInfo = {
     has_contacts_list: Boolean(conversation?.contacts?.contacts?.length),
     has_user: Boolean(conversation?.user),
     has_source_author: Boolean(conversation?.source?.author),
@@ -102,7 +102,16 @@ async function resolveAgencyFromEvent(data) {
     contact_custom_attributes: contact?.custom_attributes || null,
     company_id_on_contact: company?.company_id || null,
     app_id: data?.app_id || null,
-  });
+  };
+  logger.warn('intercom_event_resolver_debug', debugInfo);
+
+  // Extra plain-text dump so the details are visible in Railway's log UI
+  // even if it collapses structured JSON fields.
+  console.log('===== INTERCOM RESOLVER DEBUG =====');
+  console.log(JSON.stringify(debugInfo, null, 2));
+  console.log('===== CONTACT RAW =====');
+  console.log(JSON.stringify(contact, null, 2));
+  console.log('===================================');
 
   return null;
 }
