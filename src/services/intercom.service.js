@@ -41,8 +41,9 @@ function verifySignature(rawBody, signatureHeader) {
 
 /**
  * Extract the primary contact from an Intercom conversation payload.
- * Modern Intercom webhooks put the full contact (with custom_attributes)
- * in `contacts.contacts[]`. Older payloads used `user` or `source.author`.
+ * Modern Intercom webhooks only include a stripped contact reference
+ * (type / id / external_id) in `contacts.contacts[]`. The full contact
+ * must be hydrated via the REST API — see hydrateContact below.
  */
 function extractPrimaryContact(conversation) {
   const fromContactsList = conversation?.contacts?.contacts?.[0];
@@ -55,6 +56,56 @@ function extractPrimaryContact(conversation) {
 }
 
 /**
+ * Fetch a full Contact from Intercom's REST API.
+ * Webhook payloads carry only a stripped reference, so we hydrate on demand
+ * to get `custom_attributes`, `email`, `name`, `companies`, etc.
+ */
+async function fetchContactFromIntercom(contactId) {
+  if (!contactId) return null;
+  if (!env.intercom.apiKey) {
+    logger.warn('intercom_api_key_missing_cannot_hydrate_contact', { contactId });
+    return null;
+  }
+  try {
+    const res = await fetch(`https://api.intercom.io/contacts/${contactId}`, {
+      headers: {
+        Authorization: `Bearer ${env.intercom.apiKey}`,
+        Accept: 'application/json',
+        'Intercom-Version': '2.11',
+      },
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      logger.warn('intercom_fetch_contact_failed', {
+        contactId,
+        status: res.status,
+        body: body.slice(0, 200),
+      });
+      return null;
+    }
+    return await res.json();
+  } catch (err) {
+    logger.warn('intercom_fetch_contact_error', {
+      contactId,
+      error: err.message,
+    });
+    return null;
+  }
+}
+
+/**
+ * Hydrate a stripped contact reference from a webhook payload into a full
+ * contact object. No-op if the contact already has custom_attributes.
+ */
+async function hydrateContact(contact) {
+  if (!contact) return null;
+  if (contact.custom_attributes) return contact;
+  if (!contact.id) return contact;
+  const full = await fetchContactFromIntercom(contact.id);
+  return full || contact;
+}
+
+/**
  * Resolve the tenant agency for an Intercom event.
  *
  * Strategy (in priority order):
@@ -64,7 +115,9 @@ function extractPrimaryContact(conversation) {
  */
 async function resolveAgencyFromEvent(data) {
   const conversation = data?.item || data;
-  const contact = extractPrimaryContact(conversation);
+  let contact = extractPrimaryContact(conversation);
+  // Webhook payloads are stripped refs; hydrate so we can read custom_attributes.
+  contact = await hydrateContact(contact);
   const company =
     contact?.companies?.companies?.[0] || contact?.companies?.[0];
 
@@ -228,7 +281,7 @@ async function handleEvent(event) {
     return { status: 'ignored', reason: 'no_conversation_id' };
   }
 
-  const intercomUser = extractPrimaryContact(conversation);
+  const intercomUser = await hydrateContact(extractPrimaryContact(conversation));
   const user = await upsertClientUser({ agency, intercomUser });
   if (!user) {
     logger.warn('intercom_event_no_user', { topic, conversation_id: intercomConversationId });
