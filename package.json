@@ -9,6 +9,8 @@
     "dev": "nodemon src/server.js",
     "seed": "node src/utils/seed.js",
     "set-admin": "node src/utils/set-admin.js",
+    "merge-articles": "node src/utils/merge-articles.js",
+    "dedupe-articles": "node src/utils/dedupe-articles.js",
     "test-email": "node src/utils/test-email.js"
   },
   "engines": {

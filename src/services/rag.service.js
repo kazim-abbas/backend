@@ -37,17 +37,18 @@ async function embed(text) {
 }
 
 /**
- * Retrieve top-k relevant help articles for a query within an agency.
+ * Retrieve top-k relevant help articles for a query.
  *
- * Implementation note: for now we do exact kNN in JS over the agency's articles.
- * At scale (>10k articles/agency) this should move to Atlas Vector Search or a
- * dedicated vector store. The interface here stays the same.
+ * Articles are a single shared pool used by every agency, so we no longer
+ * filter by `agency_id`. The parameter is still accepted and ignored for
+ * backwards compatibility with older callers. Scale note: exact kNN in JS
+ * is fine up to a few thousand articles; above that, move the embedding
+ * column into Atlas Vector Search or a dedicated vector store.
  */
-async function retrieveArticles({ agency_id, query, topK = 3 }) {
+async function retrieveArticles({ agency_id: _ignored, query, topK = 3 }) {
   const { vector, usage } = await embed(query);
 
   const articles = await HelpArticle.find({
-    agency_id,
     is_published: true,
   })
     .select('+embedding')

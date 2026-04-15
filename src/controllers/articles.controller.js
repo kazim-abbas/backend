@@ -5,8 +5,19 @@ const ragService = require('../services/rag.service');
 const tokenService = require('../services/token.service');
 const env = require('../config/env');
 
+/**
+ * Articles are a single shared pool. Every agency's AI and every agency's
+ * knowledge-base page reads from the same collection. Only platform admins
+ * can create / update / delete (enforced at the route layer); all other
+ * authenticated users get a read-only, published-only view.
+ */
+
+function isAdmin(req) {
+  return req.user?.role === 'admin';
+}
+
 const list = asyncHandler(async (req, res) => {
-  const filter = { ...req.tenantFilter };
+  const filter = isAdmin(req) ? {} : { is_published: true };
   const items = await HelpArticle.find(filter)
     .sort({ updated_at: -1 })
     .lean();
@@ -14,19 +25,18 @@ const list = asyncHandler(async (req, res) => {
 });
 
 const getById = asyncHandler(async (req, res) => {
-  const item = await HelpArticle.findOne({
-    _id: req.params.id,
-    ...req.tenantFilter,
-  }).lean();
+  const filter = isAdmin(req)
+    ? { _id: req.params.id }
+    : { _id: req.params.id, is_published: true };
+  const item = await HelpArticle.findOne(filter).lean();
   if (!item) throw AppError.notFound('Article not found');
   res.json({ item });
 });
 
 const create = asyncHandler(async (req, res) => {
-  if (!req.agency) throw AppError.badRequest('Agency context required');
   const article = new HelpArticle({
     ...req.body,
-    agency_id: req.agency._id,
+    // agency_id intentionally omitted — articles are global.
   });
 
   // Try to index (embed + save). If embedding fails (e.g. OpenAI down or
@@ -34,7 +44,10 @@ const create = asyncHandler(async (req, res) => {
   // RAG until re-indexed later. `article.isNew` is true until a successful save.
   try {
     const { embedding_usage } = await ragService.indexArticle(article);
-    if (embedding_usage) {
+    // Embedding cost for the shared knowledge base is a platform expense —
+    // no agency is charged. If that changes, assign a "platform" agency
+    // record and pass it here.
+    if (embedding_usage && req.agency) {
       await tokenService.recordUsage({
         agency: req.agency,
         feature: 'embedding',
@@ -50,10 +63,7 @@ const create = asyncHandler(async (req, res) => {
 });
 
 const update = asyncHandler(async (req, res) => {
-  const article = await HelpArticle.findOne({
-    _id: req.params.id,
-    ...req.tenantFilter,
-  });
+  const article = await HelpArticle.findById(req.params.id);
   if (!article) throw AppError.notFound('Article not found');
 
   Object.assign(article, req.body);
@@ -80,10 +90,7 @@ const update = asyncHandler(async (req, res) => {
 });
 
 const remove = asyncHandler(async (req, res) => {
-  const result = await HelpArticle.findOneAndDelete({
-    _id: req.params.id,
-    ...req.tenantFilter,
-  });
+  const result = await HelpArticle.findByIdAndDelete(req.params.id);
   if (!result) throw AppError.notFound('Article not found');
   res.status(204).end();
 });
