@@ -106,6 +106,136 @@ async function hydrateContact(contact) {
 }
 
 /**
+ * Low-level HTTP helper for Intercom REST API writes.
+ * All outbound calls require INTERCOM_API_KEY + INTERCOM_ADMIN_ID.
+ */
+async function intercomRequest(method, path, body) {
+  if (!env.intercom.apiKey) {
+    logger.warn('intercom_outbound_api_key_missing', { path });
+    return { ok: false, reason: 'no_api_key' };
+  }
+  try {
+    const res = await fetch(`https://api.intercom.io${path}`, {
+      method,
+      headers: {
+        Authorization: `Bearer ${env.intercom.apiKey}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'Intercom-Version': '2.11',
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      logger.warn('intercom_outbound_failed', {
+        method,
+        path,
+        status: res.status,
+        body: text.slice(0, 300),
+      });
+      return { ok: false, status: res.status, body: text };
+    }
+    const json = await res.json().catch(() => ({}));
+    return { ok: true, json };
+  } catch (err) {
+    logger.error('intercom_outbound_error', { method, path, error: err.message });
+    return { ok: false, reason: 'network_error', error: err.message };
+  }
+}
+
+/**
+ * Post an admin reply (comment) onto an Intercom conversation. This makes
+ * the agent's dashboard reply visible to the end user inside the Messenger.
+ */
+async function sendAdminReplyToIntercom({ conversationId, body }) {
+  if (!conversationId || !body) return { ok: false, reason: 'missing_args' };
+  if (!env.intercom.adminId) {
+    logger.warn('intercom_admin_id_missing_cannot_reply', { conversationId });
+    return { ok: false, reason: 'no_admin_id' };
+  }
+  return intercomRequest('POST', `/conversations/${conversationId}/reply`, {
+    message_type: 'comment',
+    type: 'admin',
+    admin_id: env.intercom.adminId,
+    body,
+  });
+}
+
+/**
+ * Assign an Intercom conversation to a specific teammate or team. Used
+ * when the AI hands off to a human — flips the conversation out of the
+ * bot-handled bucket so human agents see it in Intercom.
+ */
+async function assignConversation({ conversationId, assigneeId, teamId }) {
+  if (!conversationId) return { ok: false, reason: 'missing_conversation_id' };
+  if (!env.intercom.adminId) {
+    return { ok: false, reason: 'no_admin_id' };
+  }
+  const body = {
+    message_type: 'assignment',
+    type: 'admin',
+    admin_id: env.intercom.adminId,
+    assignee_id: assigneeId || teamId || env.intercom.adminId,
+  };
+  return intercomRequest('POST', `/conversations/${conversationId}/parts`, body);
+}
+
+/**
+ * Post a note (internal comment, only visible to admins in Intercom) onto
+ * a conversation. Handy for stamping AI-handoff context when we route to
+ * a human — the agent picks up the conversation with the reason pre-loaded.
+ */
+async function addNoteToIntercom({ conversationId, body }) {
+  if (!conversationId || !body) return { ok: false, reason: 'missing_args' };
+  if (!env.intercom.adminId) return { ok: false, reason: 'no_admin_id' };
+  return intercomRequest('POST', `/conversations/${conversationId}/reply`, {
+    message_type: 'note',
+    type: 'admin',
+    admin_id: env.intercom.adminId,
+    body,
+  });
+}
+
+/**
+ * Change an Intercom conversation's state to match a dashboard status update.
+ * Mapping:
+ *   dashboard.open     → Intercom "open"     (message_type: open)
+ *   dashboard.pending  → Intercom "snoozed"  (message_type: snoozed, +24h)
+ *   dashboard.resolved → Intercom "closed"   (message_type: close)
+ *   dashboard.closed   → Intercom "closed"   (message_type: close)
+ */
+async function syncStatusToIntercom({ conversationId, dashboardStatus }) {
+  if (!conversationId) return { ok: false, reason: 'missing_conversation_id' };
+  if (!env.intercom.adminId) {
+    logger.warn('intercom_admin_id_missing_cannot_sync_status', { conversationId });
+    return { ok: false, reason: 'no_admin_id' };
+  }
+
+  let body;
+  switch (dashboardStatus) {
+    case 'open':
+      body = { message_type: 'open', type: 'admin', admin_id: env.intercom.adminId };
+      break;
+    case 'pending':
+      body = {
+        message_type: 'snoozed',
+        type: 'admin',
+        admin_id: env.intercom.adminId,
+        snoozed_until: Math.floor(Date.now() / 1000) + 60 * 60 * 24, // 24h
+      };
+      break;
+    case 'resolved':
+    case 'closed':
+      body = { message_type: 'close', type: 'admin', admin_id: env.intercom.adminId };
+      break;
+    default:
+      return { ok: false, reason: 'unsupported_status' };
+  }
+
+  return intercomRequest('POST', `/conversations/${conversationId}/parts`, body);
+}
+
+/**
  * Resolve the tenant agency for an Intercom event.
  *
  * Strategy (in priority order):
@@ -297,11 +427,17 @@ async function handleEvent(event) {
   });
 
   if (!ticket) {
+    // Intercom Messenger conversations rarely carry an explicit subject;
+    // fall back to a short slice of the first message so the ticket is
+    // identifiable in the list view and email notifications.
+    const derivedSubject =
+      conversation.source?.subject ||
+      deriveSubjectFromText(messages[0]?.text || '');
     ticket = await Ticket.create({
       intercom_conversation_id: intercomConversationId,
       agency_id: agency._id,
       user_id: user._id,
-      subject: conversation.source?.subject || '',
+      subject: derivedSubject,
       messages,
       status: statusFromIntercom(conversation.state),
       last_message_at:
@@ -316,7 +452,13 @@ async function handleEvent(event) {
       ticket.messages.push(...newOnes);
       ticket.last_message_at = newOnes[newOnes.length - 1].timestamp;
     }
-    ticket.status = statusFromIntercom(conversation.state) || ticket.status;
+    const newStatus = statusFromIntercom(conversation.state) || ticket.status;
+    if (newStatus !== ticket.status) {
+      ticket.status = newStatus;
+      if (newStatus === 'resolved' && !ticket.resolved_at) {
+        ticket.resolved_at = new Date();
+      }
+    }
     await ticket.save();
   }
 
@@ -335,6 +477,16 @@ async function handleEvent(event) {
   };
 }
 
+function deriveSubjectFromText(text) {
+  const cleaned = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!cleaned) return '';
+  if (cleaned.length <= 60) return cleaned;
+  // Prefer cutting at the last word boundary within 60 chars.
+  const slice = cleaned.slice(0, 60);
+  const lastSpace = slice.lastIndexOf(' ');
+  return (lastSpace > 30 ? slice.slice(0, lastSpace) : slice) + '…';
+}
+
 function statusFromIntercom(state) {
   if (!state) return null;
   if (state === 'open') return 'open';
@@ -348,4 +500,8 @@ module.exports = {
   handleEvent,
   resolveAgencyFromEvent,
   extractMessages,
+  sendAdminReplyToIntercom,
+  syncStatusToIntercom,
+  assignConversation,
+  addNoteToIntercom,
 };

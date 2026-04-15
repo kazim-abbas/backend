@@ -27,6 +27,18 @@ const UserSchema = new mongoose.Schema(
 
     intercom_user_id: { type: String, default: '', index: true },
 
+    // Email verification: users created via the password-based signup start
+    // unverified. Clients ingested from Intercom are implicitly trusted since
+    // Intercom already owns the identity, so we default them to verified.
+    email_verified: { type: Boolean, default: false },
+    email_verification_token_hash: { type: String, default: '', select: false },
+    email_verification_expires: { type: Date, default: null, select: false },
+
+    // Password reset: hashed token with a short TTL. The hash (not the raw
+    // token) is stored so a DB leak alone can't reset anyone's password.
+    password_reset_token_hash: { type: String, default: '', select: false },
+    password_reset_expires: { type: Date, default: null, select: false },
+
     is_active: { type: Boolean, default: true },
     last_login_at: { type: Date },
   },
@@ -55,6 +67,7 @@ UserSchema.methods.toPublicJSON = function () {
     role: this.role,
     agency_id: this.agency_id ? this.agency_id.toString() : null,
     is_active: this.is_active,
+    email_verified: this.email_verified,
     created_at: this.created_at,
   };
 };

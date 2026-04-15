@@ -15,6 +15,11 @@ const env = {
   port: parseInt(optional('PORT', '4000'), 10),
   corsOrigin: optional('CORS_ORIGIN', 'http://localhost:3000'),
 
+  // Public URL of the frontend — used to build password-reset and
+  // email-verification links sent to users. Falls back to CORS_ORIGIN since
+  // both normally point at the same place.
+  frontendUrl: optional('FRONTEND_URL', optional('CORS_ORIGIN', 'http://localhost:3000')),
+
   mongodbUri: required('MONGODB_URI'),
 
   jwtSecret: required('JWT_SECRET'),

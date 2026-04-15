@@ -67,6 +67,66 @@ async function sendReplyNotification({ agency, ticket, recipientEmail, replyText
   });
 }
 
+async function sendPasswordResetEmail({ email, name, resetUrl }) {
+  if (!email) return { skipped: true };
+  return send({
+    to: email,
+    subject: 'Reset your password',
+    text: `Hi ${name || 'there'},
+
+You (or someone using this email) asked to reset your password. Click the link below to set a new one:
+
+${resetUrl}
+
+If you didn't request a reset, you can safely ignore this email — your password will not change.
+
+This link expires in 1 hour.`,
+    html: `
+      <p>Hi ${escapeHtml(name || 'there')},</p>
+      <p>You (or someone using this email) asked to reset your password. Click the button below to set a new one:</p>
+      <p>
+        <a href="${escapeHtml(resetUrl)}"
+           style="display:inline-block;padding:10px 16px;border-radius:6px;background:#5b8def;color:#fff;text-decoration:none;">
+          Reset password
+        </a>
+      </p>
+      <p style="font-size:12px;color:#666;">Or paste this link into your browser:<br/>
+        <span style="word-break:break-all;">${escapeHtml(resetUrl)}</span>
+      </p>
+      <p style="font-size:12px;color:#666;">If you didn't request a reset, you can safely ignore this email — your password will not change. This link expires in 1 hour.</p>
+    `,
+  });
+}
+
+async function sendEmailVerification({ email, name, verifyUrl }) {
+  if (!email) return { skipped: true };
+  return send({
+    to: email,
+    subject: 'Verify your email',
+    text: `Hi ${name || 'there'},
+
+Welcome! Please confirm your email address by opening the link below:
+
+${verifyUrl}
+
+This link expires in 24 hours.`,
+    html: `
+      <p>Hi ${escapeHtml(name || 'there')},</p>
+      <p>Welcome! Please confirm your email address by clicking the button below:</p>
+      <p>
+        <a href="${escapeHtml(verifyUrl)}"
+           style="display:inline-block;padding:10px 16px;border-radius:6px;background:#5b8def;color:#fff;text-decoration:none;">
+          Verify email
+        </a>
+      </p>
+      <p style="font-size:12px;color:#666;">Or paste this link into your browser:<br/>
+        <span style="word-break:break-all;">${escapeHtml(verifyUrl)}</span>
+      </p>
+      <p style="font-size:12px;color:#666;">This link expires in 24 hours.</p>
+    `,
+  });
+}
+
 async function sendTokenUsageWarning({ agency, percent }) {
   if (!agency?.contact_email) return { skipped: true };
   return send({
@@ -93,4 +153,6 @@ module.exports = {
   sendNewTicketAlert,
   sendReplyNotification,
   sendTokenUsageWarning,
+  sendPasswordResetEmail,
+  sendEmailVerification,
 };

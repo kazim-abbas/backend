@@ -11,6 +11,7 @@ const router = express.Router();
 router.use(authenticate, resolveTenant);
 
 router.get('/', validate({ query: v.tickets.list }), ctrl.list);
+router.get('/stats', ctrl.stats);
 router.get('/:id', validate({ params: v.tickets.getById }), ctrl.getById);
 
 router.patch(

@@ -21,13 +21,20 @@ async function run() {
   const settings = await AdminSettings.getSingleton();
   logger.info('seed_admin_settings_ready', { id: settings._id.toString() });
 
-  const adminEmail = 'admin@example.com';
+  const adminEmail = 'support@ghle.net';
+  const adminPassword = 'Kazim@110';
   let admin = await User.findOne({ email: adminEmail, agency_id: null });
   if (!admin) {
-    admin = new User({ email: adminEmail, name: 'Platform Admin', role: 'admin', agency_id: null });
-    await admin.setPassword('ChangeMe123!');
+    admin = new User({
+      email: adminEmail,
+      name: 'Platform Admin',
+      role: 'admin',
+      agency_id: null,
+      email_verified: true,
+    });
+    await admin.setPassword(adminPassword);
     await admin.save();
-    logger.info('seed_admin_created', { email: adminEmail, password: 'ChangeMe123!' });
+    logger.info('seed_admin_created', { email: adminEmail });
   }
 
   let agency = await Agency.findOne({ slug: 'demo-agency' });

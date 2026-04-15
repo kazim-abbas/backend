@@ -16,6 +16,21 @@ const auth = {
     password: z.string().min(1),
     agency_slug: z.string().optional(),
   }),
+  forgotPassword: z.object({
+    email: z.string().email(),
+    agency_slug: z.string().optional(),
+  }),
+  resetPassword: z.object({
+    token: z.string().min(20).max(200),
+    password: z.string().min(8).max(200),
+  }),
+  verifyEmail: z.object({
+    token: z.string().min(20).max(200),
+  }),
+  resendVerification: z.object({
+    email: z.string().email(),
+    agency_slug: z.string().optional(),
+  }),
 };
 
 const tickets = {

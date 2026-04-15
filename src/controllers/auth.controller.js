@@ -15,4 +15,39 @@ const me = asyncHandler(async (req, res) => {
   res.json({ user: req.user.toPublicJSON() });
 });
 
-module.exports = { register, login, me };
+const forgotPassword = asyncHandler(async (req, res) => {
+  await authService.forgotPassword(req.body);
+  // Always opaque: don't reveal whether the email existed.
+  res.json({
+    ok: true,
+    message: 'If an account exists for that email, a reset link has been sent.',
+  });
+});
+
+const resetPassword = asyncHandler(async (req, res) => {
+  const { user, token } = await authService.resetPassword(req.body);
+  res.json({ user: user.toPublicJSON(), token });
+});
+
+const verifyEmail = asyncHandler(async (req, res) => {
+  const { user } = await authService.verifyEmail(req.body);
+  res.json({ user: user.toPublicJSON() });
+});
+
+const resendVerification = asyncHandler(async (req, res) => {
+  await authService.resendVerification(req.body);
+  res.json({
+    ok: true,
+    message: 'If the account exists and is unverified, a new link has been sent.',
+  });
+});
+
+module.exports = {
+  register,
+  login,
+  me,
+  forgotPassword,
+  resetPassword,
+  verifyEmail,
+  resendVerification,
+};

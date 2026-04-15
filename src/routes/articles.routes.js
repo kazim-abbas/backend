@@ -13,16 +13,16 @@ router.get('/', ctrl.list);
 router.get('/:id', ctrl.getById);
 router.post(
   '/',
-  requireRole('admin', 'agency'),
+  requireRole('admin'),
   validate({ body: v.article.create }),
   ctrl.create
 );
 router.patch(
   '/:id',
-  requireRole('admin', 'agency'),
+  requireRole('admin'),
   validate({ body: v.article.update }),
   ctrl.update
 );
-router.delete('/:id', requireRole('admin', 'agency'), ctrl.remove);
+router.delete('/:id', requireRole('admin'), ctrl.remove);
 
 module.exports = router;
