@@ -62,6 +62,10 @@ const TicketSchema = new mongoose.Schema(
 
     last_message_at: { type: Date, default: Date.now, index: true },
     resolved_at: { type: Date },
+    // Stamped on the first transition into the "closed" status. Doubles as
+    // the idempotency key for the closed-ticket transcript email so repeated
+    // PATCHes to "closed" don't re-send the email.
+    closed_at: { type: Date },
   },
   { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' } }
 );

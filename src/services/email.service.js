@@ -201,6 +201,102 @@ This code expires in ${ttlMinutes} minutes. If you didn't start a signup, you ca
   });
 }
 
+/**
+ * Email the full conversation transcript to the agency when a ticket is
+ * closed. Includes every message with sender, role, timestamp, and body.
+ *
+ * Sends plain text and HTML. The HTML uses inline styles only (email clients
+ * strip <style> tags) with a light role-based background so the sender is
+ * scannable at a glance.
+ */
+async function sendClosedTicketTranscript({ agency, ticket, recipientEmail }) {
+  const to = recipientEmail || agency?.contact_email;
+  if (!to) return { skipped: true, reason: 'no_recipient' };
+  if (!ticket) return { skipped: true, reason: 'no_ticket' };
+
+  const messages = Array.isArray(ticket.messages) ? ticket.messages : [];
+  const subjectLine = ticket.subject || `Ticket ${ticket._id}`;
+
+  const roleLabel = (sender) => {
+    if (sender === 'agent') return 'Agent';
+    if (sender === 'ai') return 'AI assistant';
+    if (sender === 'system') return 'System';
+    return 'Customer';
+  };
+
+  // Plain-text transcript. Kept in a predictable format so it reads cleanly
+  // in text-only mail clients and can be grepped if forwarded.
+  const textBody = messages.length
+    ? messages
+        .map((m) => {
+          const when = new Date(m.timestamp).toISOString();
+          const who = m.sender_name || roleLabel(m.sender);
+          return `[${when}] ${who} (${roleLabel(m.sender)})\n${m.text}\n`;
+        })
+        .join('\n')
+    : '(no messages)';
+
+  const bgForSender = (sender) => {
+    if (sender === 'agent') return '#eaf2ff';
+    if (sender === 'ai') return '#ecfbee';
+    if (sender === 'system') return '#f4f4f4';
+    return '#f8f8f8';
+  };
+  const borderForSender = (sender) => {
+    if (sender === 'agent') return '#5b8def';
+    if (sender === 'ai') return '#4caf50';
+    if (sender === 'system') return '#999999';
+    return '#d0d0d0';
+  };
+
+  const htmlMessages = messages.length
+    ? messages
+        .map((m) => {
+          const who = escapeHtml(m.sender_name || roleLabel(m.sender));
+          const role = escapeHtml(roleLabel(m.sender));
+          const when = escapeHtml(new Date(m.timestamp).toLocaleString());
+          return `
+            <div style="margin:12px 0;padding:12px 14px;border-radius:6px;background:${bgForSender(
+              m.sender
+            )};border-left:3px solid ${borderForSender(m.sender)};">
+              <div style="font-size:12px;color:#555;margin-bottom:6px;">
+                <strong>${who}</strong>
+                <span style="text-transform:uppercase;letter-spacing:0.5px;color:#888;margin-left:6px;">${role}</span>
+                <span style="float:right;">${when}</span>
+              </div>
+              <div style="white-space:pre-wrap;color:#1a1a1a;">${escapeHtml(m.text || '')}</div>
+            </div>
+          `;
+        })
+        .join('')
+    : '<p><em>(no messages)</em></p>';
+
+  return send({
+    to,
+    subject: `[${agency?.name || 'Support'}] Ticket closed: ${subjectLine}`,
+    text: `Ticket closed
+Agency: ${agency?.name || ''}
+Subject: ${subjectLine}
+Ticket ID: ${ticket._id}
+Messages: ${messages.length}
+
+--- Conversation ---
+
+${textBody}
+`,
+    html: `
+      <h2 style="margin:0 0 8px 0;">Ticket closed</h2>
+      <p style="margin:4px 0;"><strong>Agency:</strong> ${escapeHtml(agency?.name || '')}</p>
+      <p style="margin:4px 0;"><strong>Subject:</strong> ${escapeHtml(subjectLine)}</p>
+      <p style="margin:4px 0;"><strong>Ticket ID:</strong> ${escapeHtml(String(ticket._id))}</p>
+      <p style="margin:4px 0;"><strong>Messages:</strong> ${messages.length}</p>
+      <hr style="border:none;border-top:1px solid #e5e5e5;margin:16px 0;" />
+      <h3 style="margin:0 0 8px 0;">Conversation</h3>
+      ${htmlMessages}
+    `,
+  });
+}
+
 async function sendTokenUsageWarning({ agency, percent }) {
   if (!agency?.contact_email) return { skipped: true, reason: 'no_recipient' };
   return send({
@@ -226,6 +322,7 @@ module.exports = {
   send,
   sendNewTicketAlert,
   sendReplyNotification,
+  sendClosedTicketTranscript,
   sendTokenUsageWarning,
   sendPasswordResetEmail,
   sendSignupOtp,

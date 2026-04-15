@@ -1,7 +1,8 @@
 const asyncHandler = require('../utils/asyncHandler');
 const AppError = require('../utils/AppError');
-const { Ticket } = require('../models');
+const { Ticket, Agency } = require('../models');
 const intercomService = require('../services/intercom.service');
+const emailService = require('../services/email.service');
 const logger = require('../utils/logger');
 
 /**
@@ -51,19 +52,32 @@ const getById = asyncHandler(async (req, res) => {
 });
 
 const updateStatus = asyncHandler(async (req, res) => {
-  const ticket = await Ticket.findOneAndUpdate(
-    { _id: req.params.id, ...req.tenantFilter },
-    {
-      status: req.body.status,
-      ...(req.body.status === 'resolved' ? { resolved_at: new Date() } : {}),
-    },
-    { new: true }
-  );
+  // Load-then-save (instead of findOneAndUpdate) so we can compare the
+  // previous status. We specifically need to know if this PATCH is the
+  // one that flipped the ticket into "closed" — that's when the transcript
+  // email should fire, and exactly once per ticket lifecycle.
+  const ticket = await Ticket.findOne({
+    _id: req.params.id,
+    ...req.tenantFilter,
+  });
   if (!ticket) throw AppError.notFound('Ticket not found');
+
+  const prevStatus = ticket.status;
+  const newStatus = req.body.status;
+  const isNewlyClosed = newStatus === 'closed' && !ticket.closed_at;
+
+  ticket.status = newStatus;
+  if (newStatus === 'resolved' && !ticket.resolved_at) {
+    ticket.resolved_at = new Date();
+  }
+  if (isNewlyClosed) {
+    ticket.closed_at = new Date();
+  }
+  await ticket.save();
 
   // Mirror the status change to Intercom. Fire-and-forget: a local success
   // is what the user cares about; we just log sync failures.
-  if (ticket.intercom_conversation_id) {
+  if (ticket.intercom_conversation_id && prevStatus !== newStatus) {
     intercomService
       .syncStatusToIntercom({
         conversationId: ticket.intercom_conversation_id,
@@ -79,6 +93,40 @@ const updateStatus = asyncHandler(async (req, res) => {
       })
       .catch((err) =>
         logger.error('intercom_status_sync_threw', { error: err.message })
+      );
+  }
+
+  // Transcript email: only on the transition into "closed", never on a
+  // repeat PATCH or on resolved→closed bounce. Fire-and-forget so a slow
+  // mail provider can't stall the API response.
+  if (isNewlyClosed) {
+    const agency = req.agency || (await Agency.findById(ticket.agency_id).catch(() => null));
+    emailService
+      .sendClosedTicketTranscript({ agency, ticket })
+      .then((result) => {
+        if (result?.sent) {
+          logger.info('closed_ticket_transcript_sent', {
+            ticket_id: ticket._id.toString(),
+            to: agency?.contact_email,
+            id: result.id,
+          });
+        } else if (result?.skipped) {
+          logger.warn('closed_ticket_transcript_skipped', {
+            ticket_id: ticket._id.toString(),
+            reason: result.reason,
+          });
+        } else if (result?.sent === false) {
+          logger.error('closed_ticket_transcript_failed', {
+            ticket_id: ticket._id.toString(),
+            error: result.error,
+          });
+        }
+      })
+      .catch((err) =>
+        logger.error('closed_ticket_transcript_threw', {
+          ticket_id: ticket._id.toString(),
+          error: err.message,
+        })
       );
   }
 
