@@ -66,7 +66,7 @@ const update = asyncHandler(async (req, res) => {
   const article = await HelpArticle.findById(req.params.id);
   if (!article) throw AppError.notFound('Article not found');
 
-  Object.assign(article, req.body);
+  article.set(req.body);
 
   if (req.body.title !== undefined || req.body.content !== undefined) {
     try {
